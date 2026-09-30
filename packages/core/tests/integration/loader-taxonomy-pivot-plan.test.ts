@@ -1,0 +1,181 @@
+/**
+ * Query-plan shape of the pivot-driven taxonomy listing (#1834).
+ *
+ * On stats-blind SQLite/D1 (no ANALYZE, no `sqlite_stat1`) the old EXISTS shape
+ * drove the scan from the collection's order index and probed a taxonomy EXISTS
+ * per row — a full `ec_*` walk for a selective term. The restructure seeks the
+ * term on the group-keyed pivot, then seeks matching content translations by
+ * `translation_group`. Sorting is bounded to the tagged candidates.
+ *
+ * This asserts the plan, not the output (output is covered by
+ * loader-taxonomy-pivot). SQLite-only: `EXPLAIN QUERY PLAN` is a SQLite concern
+ * and, being stats-blind here, the plan is schema-driven — matching D1 exactly.
+ */
+
+import { Kysely, SqliteDialect } from "kysely";
+import { afterEach, beforeEach, expect, it } from "vitest";
+
+import { NodeSqliteCompatDatabase as Database } from "#node-sqlite";
+
+import { runMigrations } from "../../src/database/migrations/runner.js";
+import { ContentRepository } from "../../src/database/repositories/content.js";
+import { TaxonomyRepository } from "../../src/database/repositories/taxonomy.js";
+import type { Database as DatabaseSchema } from "../../src/database/types.js";
+import { emdashLoader, resetTaxonomyNamesCache } from "../../src/loader.js";
+import { runWithContext } from "../../src/request-context.js";
+import { SchemaRegistry } from "../../src/schema/registry.js";
+
+interface CapturedQuery {
+	sql: string;
+	parameters: readonly unknown[];
+}
+
+let sqlite: Database;
+let db: Kysely<DatabaseSchema>;
+let captured: CapturedQuery[];
+
+beforeEach(async () => {
+	captured = [];
+	sqlite = new Database(":memory:");
+	db = new Kysely<DatabaseSchema>({
+		dialect: new SqliteDialect({ database: sqlite }),
+		log(event) {
+			if (event.level === "query") {
+				captured.push({ sql: event.query.sql, parameters: event.query.parameters });
+			}
+		},
+	});
+
+	// Deliberately no ANALYZE: matches D1, which never maintains sqlite_stat1.
+	await runMigrations(db);
+	await db
+		.updateTable("_emdash_taxonomy_def_groups")
+		.set({ collections: JSON.stringify(["post"]) })
+		.where("name", "in", ["category", "tag"])
+		.execute();
+	resetTaxonomyNamesCache();
+	const registry = new SchemaRegistry(db);
+	await registry.createCollection({ slug: "post", label: "Posts", labelSingular: "Post" });
+	await registry.createField("post", { slug: "title", label: "Title", type: "string" });
+
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any -- schema vs Database type
+	const anyDb = db as any;
+	const content = new ContentRepository(anyDb);
+	const tax = new TaxonomyRepository(anyDb);
+	const term = await tax.create({ name: "category", slug: "news", label: "News", locale: "en" });
+	// A selective term: one tagged entry among many. The plan is stats-blind so
+	// the ratio is immaterial — the point is that the seek short-circuits.
+	for (let i = 0; i < 30; i++) {
+		const post = await content.create({
+			type: "post",
+			slug: `post-${i}`,
+			data: { title: `Post ${i}` },
+			status: "published",
+			locale: "en",
+		});
+		if (i === 0) await tax.attachToEntry("post", post.id, term.id);
+	}
+});
+
+afterEach(async () => {
+	await db.destroy();
+});
+
+/** Normalize application values captured from Kysely for direct driver binding. */
+function bindable(p: unknown): unknown {
+	if (typeof p === "boolean") return p ? 1 : 0;
+	if (p instanceof Date) return p.toISOString();
+	if (p === undefined) return null;
+	return p;
+}
+
+function explain(query: CapturedQuery): string {
+	const rows = sqlite
+		.prepare(`EXPLAIN QUERY PLAN ${query.sql}`)
+		.all(...query.parameters.map(bindable)) as { detail: string }[];
+	return rows.map((r) => r.detail).join("\n");
+}
+
+/** The pivot-driven query is the one with the `picked` CTE. */
+function pivotQueryPlan(): string {
+	const query = captured.find((q) => q.sql.includes("picked"));
+	expect(query, "expected the loader to emit a pivot-driven query").toBeDefined();
+	return explain(query!);
+}
+
+/** Returns just the `picked` CTE plan (between `CO-ROUTINE picked` and `SCAN picked`). */
+function pickedCtePlan(plan: string): string {
+	const start = plan.indexOf("CO-ROUTINE picked\n");
+	expect(start, "expected a CO-ROUTINE picked section").toBeGreaterThan(-1);
+	const end = plan.indexOf("\nSCAN picked", start);
+	if (end === -1) return plan.slice(start);
+	return plan.slice(start, end);
+}
+
+async function runLoad(extra: Record<string, unknown>): Promise<void> {
+	captured = [];
+	const loader = emdashLoader();
+	await runWithContext({ editMode: false, db }, () =>
+		loader.loadCollection!({
+			filter: { type: "post", where: { category: "news" } as never, limit: 5, ...extra },
+		}),
+	);
+}
+
+it("seeks group assignments for a published_at sort using the deleted-published index", async () => {
+	await runLoad({ orderBy: { published_at: "desc" } });
+	const plan = pivotQueryPlan();
+	const picked = pickedCtePlan(plan);
+	expect(picked).toContain("idx_ec_post_deleted_published_id");
+	expect(picked).not.toContain("USE TEMP B-TREE FOR ORDER BY");
+	expect(plan).not.toContain("SCAN r");
+	expect(plan).not.toContain("SCAN ct");
+});
+
+it("seeks group assignments for the default created_at sort using the deleted-created index", async () => {
+	await runLoad({});
+	const plan = pivotQueryPlan();
+	const picked = pickedCtePlan(plan);
+	expect(picked).toContain("idx_ec_post_deleted_created_id");
+	expect(picked).not.toContain("USE TEMP B-TREE FOR ORDER BY");
+	expect(plan).not.toContain("SCAN r");
+	expect(plan).not.toContain("SCAN ct");
+});
+
+it("seeks group assignments and the requested content locale without a temp sort", async () => {
+	await runLoad({ orderBy: { published_at: "desc" }, locale: "en" });
+	const plan = pivotQueryPlan();
+	const picked = pickedCtePlan(plan);
+	expect(picked).toContain("idx_ec_post_deleted_published_id");
+	expect(picked).not.toContain("USE TEMP B-TREE FOR ORDER BY");
+	expect(plan).not.toContain("SCAN r");
+	expect(plan).not.toContain("SCAN ct");
+});
+
+it("updated_at sort seeks the term via the pivot and does not full-scan the content table", async () => {
+	await runLoad({ orderBy: { updated_at: "desc" } });
+	const plan = pivotQueryPlan();
+	const picked = pickedCtePlan(plan);
+	expect(picked).toContain("content_taxonomies");
+	expect(picked).not.toContain("SCAN ct");
+	expect(plan).not.toContain("SCAN r");
+});
+
+it("keeps the pivot as the outer table for a temp sort, and frees it for an indexed sort", async () => {
+	// `EXPLAIN QUERY PLAN` differs between D1 and local SQLite for the same plain
+	// JOIN, so this test pins the join the builder emits as the stable contract.
+	const pickedJoin = () => {
+		const query = captured.find((q) => q.sql.includes("picked"));
+		expect(query, "expected the loader to emit a pivot-driven query").toBeDefined();
+		return /content_taxonomies ct\s+(CROSS JOIN|JOIN) "ec_post" AS r/.exec(query!.sql)?.[1];
+	};
+
+	await runLoad({ orderBy: { updated_at: "desc" } });
+	expect(pickedJoin()).toBe("CROSS JOIN");
+
+	await runLoad({ orderBy: { title: "asc" } });
+	expect(pickedJoin()).toBe("CROSS JOIN");
+
+	await runLoad({ orderBy: { published_at: "desc" } });
+	expect(pickedJoin()).toBe("JOIN");
+});
